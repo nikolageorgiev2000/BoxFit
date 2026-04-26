@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import math
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import Callable
 
@@ -89,6 +90,12 @@ class SolverParams:
     w_exterior: float = 1.0
     w_ceiling: float = 1.0
     translate_step_fraction: float = 0.05
+    # Independent per-slot probability that a mutation attempt is applied in a step.
+    # If a chain samples no active mutation slots, one fallback slot is still forced to mutate.
+    slot_mutation_probability: float = 0.02
+    # Relative weights for mutation families in this order:
+    # [translate position, rotate orientation, switch bay type, toggle active/inactive].
+    mutation_probabilities: list[float] = field(default_factory=lambda: [0.55, 0.25, 0.05, 0.15])
     toggle_probability: float = 0.05
     seed: int | None = None
     temperature_samples: int = 8
@@ -307,7 +314,7 @@ def preprocess_case(case_data: CaseData, device: str | torch.device) -> Preproce
     inv_rot = rot.transpose(-1, -2).contiguous()
 
     min_bay_area = float(torch.min(bay_areas).item())
-    n_slots = min(128, math.ceil(1.25 * warehouse_area / max(min_bay_area, EPS)))
+    n_slots = min(128, math.ceil(warehouse_area / max(min_bay_area, EPS)))
     ratio = bay_costs / torch.clamp(bay_capacities, min=EPS)
     objective_scale = max(float(torch.max(ratio.pow(2)).item()), EPS)
     empty_state_objective = objective_scale * OBJECTIVE_CAP
@@ -603,6 +610,31 @@ def _randint(low: int, high: int, shape: tuple[int, ...], device: torch.device, 
     return torch.randint(low, high, shape, device=device, generator=generator)
 
 
+def _sample_move_kind(
+    shape: tuple[int, ...],
+    device: torch.device,
+    params: SolverParams,
+    generator: torch.Generator | None,
+) -> torch.Tensor:
+    if len(params.mutation_probabilities) != 4:
+        raise ValueError("mutation_probabilities must contain exactly 4 weights")
+
+    weights = torch.tensor(params.mutation_probabilities, dtype=torch.float32, device=device)
+    if torch.any(weights < 0):
+        raise ValueError("mutation_probabilities must be non-negative")
+    if float(weights.sum().item()) <= 0.0:
+        raise ValueError("mutation_probabilities must have a positive total weight")
+
+    normalized = weights / weights.sum()
+    flat_samples = torch.multinomial(
+        normalized,
+        num_samples=math.prod(shape),
+        replacement=True,
+        generator=generator,
+    )
+    return flat_samples.reshape(shape)
+
+
 def initialize_state(preprocessed: PreprocessedCase, params: SolverParams) -> AnnealingState:
     device = preprocessed.device
     generator = _make_generator(device, params.seed)
@@ -633,8 +665,16 @@ def propose_mutation(
     device = preprocessed.device
     candidate = _clone_state(state)
     n_chains, n_slots, _ = state.active.shape
-    slot_index = _randint(0, n_slots, (n_chains,), device, generator)
-    move_kind = _randint(0, 4, (n_chains,), device, generator)
+    if not (0.0 <= params.slot_mutation_probability <= 1.0):
+        raise ValueError("slot_mutation_probability must be between 0 and 1")
+
+    mutate_mask = _rand((n_chains, n_slots), device, generator) <= params.slot_mutation_probability
+    forced_slots = _randint(0, n_slots, (n_chains,), device, generator)
+    no_mutation_rows = ~torch.any(mutate_mask, dim=1)
+    if torch.any(no_mutation_rows):
+        mutate_mask[no_mutation_rows, forced_slots[no_mutation_rows]] = True
+
+    move_kind = _sample_move_kind((n_chains, n_slots), device, params, generator)
 
     bbox = preprocessed.warehouse_bbox
     x_span = float((bbox[1] - bbox[0]).item())
@@ -642,31 +682,28 @@ def propose_mutation(
     base_step = params.translate_step_fraction * max(x_span, y_span)
     scaled_step = base_step * max(temperature, EPS)
 
-    rows = torch.arange(n_chains, device=device)
-
-    translate_mask = move_kind == 0
+    translate_mask = mutate_mask & (move_kind == 0)
     if torch.any(translate_mask):
-        dx = torch.randn((n_chains,), device=device, generator=generator) * scaled_step
-        dy = torch.randn((n_chains,), device=device, generator=generator) * scaled_step
-        candidate.x[rows[translate_mask], slot_index[translate_mask]] += dx[translate_mask]
-        candidate.y[rows[translate_mask], slot_index[translate_mask]] += dy[translate_mask]
+        dx = torch.randn((n_chains, n_slots), device=device, generator=generator) * scaled_step
+        dy = torch.randn((n_chains, n_slots), device=device, generator=generator) * scaled_step
+        candidate.x = candidate.x + torch.where(translate_mask, dx, torch.zeros_like(dx))
+        candidate.y = candidate.y + torch.where(translate_mask, dy, torch.zeros_like(dy))
 
-    rotate_mask = move_kind == 1
+    rotate_mask = mutate_mask & (move_kind == 1)
     if torch.any(rotate_mask):
         delta_options = torch.tensor([-2, -1, 1, 2], device=device, dtype=candidate.theta_idx.dtype)
-        delta = delta_options[_randint(0, 4, (n_chains,), device, generator)]
-        candidate.theta_idx[rows[rotate_mask], slot_index[rotate_mask], 0] = (
-            candidate.theta_idx[rows[rotate_mask], slot_index[rotate_mask], 0] + delta[rotate_mask]
-        ) % preprocessed.rot.shape[0]
+        delta = delta_options[_randint(0, 4, (n_chains, n_slots), device, generator)]
+        updated_theta = (candidate.theta_idx[..., 0] + delta) % preprocessed.rot.shape[0]
+        candidate.theta_idx[..., 0] = torch.where(rotate_mask, updated_theta, candidate.theta_idx[..., 0])
 
-    type_mask = move_kind == 2
+    type_mask = mutate_mask & (move_kind == 2)
     if torch.any(type_mask):
-        new_types = _randint(0, preprocessed.bay_widths.shape[0], (n_chains,), device, generator)
-        candidate.type_id[rows[type_mask], slot_index[type_mask], 0] = new_types[type_mask]
+        new_types = _randint(0, preprocessed.bay_widths.shape[0], (n_chains, n_slots), device, generator)
+        candidate.type_id[..., 0] = torch.where(type_mask, new_types, candidate.type_id[..., 0])
 
-    toggle_mask = (move_kind == 3) & (_rand((n_chains,), device, generator) <= params.toggle_probability)
+    toggle_mask = mutate_mask & (move_kind == 3) & (_rand((n_chains, n_slots), device, generator) <= params.toggle_probability)
     if torch.any(toggle_mask):
-        candidate.active[rows[toggle_mask], slot_index[toggle_mask], 0] = ~candidate.active[rows[toggle_mask], slot_index[toggle_mask], 0]
+        candidate.active[..., 0] = torch.where(toggle_mask, ~candidate.active[..., 0], candidate.active[..., 0])
 
     return candidate
 
@@ -779,6 +816,7 @@ def run_simulated_annealing_gpu(
         best_eval = _eval_where(better_mask, current_eval, best_eval)
 
         best_index = _choose_overall_best(best_eval)
+        current_best_index = _choose_overall_best(current_eval)
         best_score = float(best_eval.score[best_index].item())
         feasible_count = int(best_eval.feasible.sum().item())
         if params.show_progress:
@@ -798,8 +836,8 @@ def run_simulated_annealing_gpu(
                 step_index=step_index,
                 temperature=float(temperature.item()),
                 acceptance_rate=float(acceptance_rate.item()),
-                best_state=_index_state(best_state, best_index),
-                best_evaluation=_index_eval(best_eval, best_index),
+                best_state=_index_state(current_state, current_best_index),
+                best_evaluation=_index_eval(current_eval, current_best_index),
             )
             snapshots.append(snapshot)
             if snapshot_callback is not None:

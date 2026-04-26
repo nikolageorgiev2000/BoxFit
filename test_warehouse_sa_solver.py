@@ -17,6 +17,7 @@ from warehouse_sa_solver import (
     _transform_world_to_local,
     evaluate_state_gpu,
     load_case,
+    propose_mutation,
     preprocess_case,
     run_simulated_annealing_gpu,
 )
@@ -475,6 +476,85 @@ class WarehouseSASolverTests(unittest.TestCase):
         self.assertNotIn("warehouse_polygon", solver.PreprocessedCase.__annotations__)
         self.assertNotIn("y_span", solver.PreprocessedCase.__annotations__)
         self.assertNotIn("angles_deg", solver.PreprocessedCase.__annotations__)
+
+    def test_mutation_probabilities_can_disable_type_switches(self) -> None:
+        case = CaseData(
+            warehouse_polygon=_rect_polygon(-5.0, 5.0, -5.0, 5.0),
+            bay_types=[
+                {
+                    "type_id": 0.0,
+                    "width": 2.0,
+                    "depth": 2.0,
+                    "height": 1.0,
+                    "gap_depth": 1.0,
+                    "capacity": 1.0,
+                    "cost": 1.0,
+                },
+                {
+                    "type_id": 1.0,
+                    "width": 3.0,
+                    "depth": 1.0,
+                    "height": 1.0,
+                    "gap_depth": 1.0,
+                    "capacity": 2.0,
+                    "cost": 2.0,
+                },
+            ],
+            obstacles=[],
+            ceiling_profile=[(-5.0, 10.0)],
+        )
+        pre = preprocess_case(case, self.device)
+        params = SolverParams(
+            n_chains=32,
+            seed=123,
+            mutation_probabilities=[1.0, 0.0, 0.0, 0.0],
+            translate_step_fraction=0.1,
+        )
+        state = solver.initialize_state(pre, params)
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(123)
+        candidate = propose_mutation(state, pre, params, temperature=1.0, generator=generator)
+
+        self.assertTrue(torch.equal(candidate.type_id, state.type_id))
+        self.assertTrue(torch.equal(candidate.theta_idx, state.theta_idx))
+        self.assertTrue(torch.equal(candidate.active, state.active))
+        self.assertTrue(
+            torch.any(torch.abs(candidate.x - state.x) > 1e-6).item()
+            or torch.any(torch.abs(candidate.y - state.y) > 1e-6).item()
+        )
+
+    def test_slot_mutation_probability_can_mutate_multiple_slots_per_chain(self) -> None:
+        case = CaseData(
+            warehouse_polygon=_rect_polygon(-5.0, 5.0, -5.0, 5.0),
+            bay_types=[
+                {
+                    "type_id": 0.0,
+                    "width": 2.0,
+                    "depth": 2.0,
+                    "height": 1.0,
+                    "gap_depth": 1.0,
+                    "capacity": 1.0,
+                    "cost": 1.0,
+                },
+            ],
+            obstacles=[],
+            ceiling_profile=[(-5.0, 10.0)],
+        )
+        pre = preprocess_case(case, self.device)
+        params = SolverParams(
+            n_chains=2,
+            seed=321,
+            slot_mutation_probability=1.0,
+            mutation_probabilities=[1.0, 0.0, 0.0, 0.0],
+            translate_step_fraction=0.1,
+        )
+        state = solver.initialize_state(pre, params)
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(321)
+        candidate = propose_mutation(state, pre, params, temperature=1.0, generator=generator)
+
+        moved_slots = (torch.abs(candidate.x - state.x) > 1e-6) | (torch.abs(candidate.y - state.y) > 1e-6)
+        self.assertTrue(torch.all(moved_slots).item())
 
     def test_annealing_run_returns_gpu_result(self) -> None:
         case = CaseData(
